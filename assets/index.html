@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waste sorter</title>
+<style>
+  :root { --bg:#14140f; --card:#1e1e18; --line:#33332b; --tx:#e8e6dc;
+          --dim:#96948a; --wet:#5dcaa5; --dry:#f0997b; --hold:#efaf27; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--tx);
+         font-family:system-ui,-apple-system,"Segoe UI",sans-serif; }
+  h1 { font-size:20px; font-weight:500; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:20px; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .label { font-size:12px; color:var(--dim); text-transform:none; margin-bottom:8px; }
+  .big { font-size:44px; font-weight:500; line-height:1; font-variant-numeric:taabular-nums; }
+  .counts { display:flex; gap:28px; }
+  .bar { height:22px; background:#0d0d0a; border:1px solid var(--line);
+         border-radius:6px; margin-top:12px; position:relative; overflow:hidden; }
+  .fill { height:100%; background:var(--wet); width:0%; transition:width .15s; }
+  .mark { position:absolute; top:-3px; bottom:-3px; width:2px; background:var(--dry); }
+  input[type=range] { width:100%; margin:10px 0 4px; }
+  .row { display:flex; justify-content:space-between; font-size:12px; color:var(--dim); }
+  button { background:#2a2a22; color:var(--tx); border:1px solid var(--line);
+           border-radius:8px; padding:9px 14px; font-size:13px; cursor:pointer; margin-right:8px; }
+  button:hover { border-color:#55554a; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:7px 4px; border-bottom:1px solid var(--line); }
+  td:first-child { color:var(--dim); white-space:nowrap; width:78px; }
+  .tag { font-weight:500; }
+  .WET { color:var(--wet); } .DRY { color:var(--dry); } .HOLD { color:var(--hold); }
+  .pill { display:inline-block; padding:3px 10px; border-radius:99px;
+          border:1px solid var(--line); font-size:12px; color:var(--dim); }
+  .off { opacity:.45; }
+</style>
+</head>
+<body>
+
+<h1>Waste sorter</h1>
+<div class="sub">Live moisture delta and decision log · <span id="conn" class="pill">connecting…</span> <span class="pill" style="opacity:.6">build v6 · native ws</span></div>
+<div id="diag" style="display:none;background:#2a1a15;border:1px solid #5a3a2a;border-radius:8px;padding:12px;margin-bottom:16px;font-size:13px;line-height:1.6"></div>
+
+<div class="card" style="margin-bottom:14px">
+  <div class="label">Camera — aim so one item fills the frame</div>
+  <div id="camwrap" style="position:relative;background:#0d0d0a;border:1px solid var(--line);border-radius:8px;overflow:hidden;min-height:120px;display:flex;align-items:center;justify-content:center">
+    <img id="cam" alt="camera preview" style="display:none;width:100%;max-width:480px">
+    <div id="camoff" style="color:var(--dim);font-size:13px;padding:28px">waiting for frames…</div>
+  </div>
+</div>
+
+<div class="grid">
+
+  <div class="card">
+    <div class="label">Moisture delta</div>
+    <div class="big" id="delta">–</div>
+    <div class="bar">
+      <div class="fill" id="fill"></div>
+      <div class="mark" id="mark"></div>
+    </div>
+    <div class="row"><span>0</span><span id="scale">600</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Wet threshold — drag while holding an item</div>
+    <div class="big" id="thval">150</div>
+    <input type="range" id="th" min="10" max="600" step="5" value="150">
+    <div class="row"><span>delta at or above this = WET</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Counts</div>
+    <div class="counts">
+      <div><div class="big WET" id="wet">0</div><div class="label">wet</div></div>
+      <div><div class="big DRY" id="dry">0</div><div class="label">dry</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">State</div>
+    <div style="font-size:17px;margin-bottom:6px" id="phase">idle</div>
+    <div class="label" id="vision">vision: —</div>
+    <div style="margin-top:14px">
+      <button id="reset">Reset counts</button>
+      <button id="recal">Re-baseline</button>
+    </div>
+  </div>
+
+</div>
+
+<div class="card" style="margin-top:14px">
+  <div class="label">Recent decisions</div>
+  <table id="log"><tbody></tbody></table>
+</div>
+
+<script>
+(function () {
+  var conn = document.getElementById('conn');
+  var diag = document.getElementById('diag');
+  var threshold = 150;
+  var SCALE = 600;
+  var sock = null;
+
+  // ---------------------------------------------------------------------
+  // Minimal Engine.IO v4 / Socket.IO v5 client over a raw WebSocket.
+  //
+  // The Brick's server is python-socketio 5.x. Rather than depend on a
+  // client library (no CDN reachable here, and /socket.io/socket.io.js is
+  // not served), we speak the protocol directly. It is small and stable:
+  //
+  //   server "0{...}"  engine OPEN     -> we reply "40"  (socket CONNECT)
+  //   server "40{...}" socket CONNECTED
+  //   server "2"       PING            -> we reply "3"   (PONG)
+  //   server "42[ev,d]" EVENT
+  //   we send "42[ev,d]" to emit
+  // ---------------------------------------------------------------------
+  function connect() {
+    var scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var url = scheme + location.host + '/socket.io/?EIO=4&transport=websocket';
+    var ws;
+
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      fail('could not open ' + url + ' (' + e.message + ')');
+      return;
+    }
+
+    conn.textContent = 'connecting…';
+
+    ws.onopen = function () { conn.textContent = 'handshaking…'; };
+
+    ws.onmessage = function (ev) {
+      var d = ev.data;
+      if (typeof d !== 'string' || !d.length) return;
+      var t = d.charAt(0);
+
+      if (t === '0') { ws.send('40'); return; }          // engine open
+      if (t === '2') { ws.send('3'); return; }           // ping -> pong
+      if (t !== '4') return;
+
+      var sub = d.charAt(1);
+      if (sub === '0') {                                  // socket connected
+        conn.textContent = 'connected';
+        diag.style.display = 'none';
+        return;
+      }
+      if (sub === '4') { fail('server refused the connection'); return; }
+      if (sub === '2') {                                  // event
+        var i = d.indexOf('[');
+        if (i < 0) return;
+        try {
+          var arr = JSON.parse(d.slice(i));
+          var name = arr[0];
+          var body = arr[1] || {};
+          if (name === 'frame' && body.jpeg) { showFrame(body.jpeg); return; }
+          paint(body);
+        } catch (err) { /* ignore malformed frame */ }
+      }
+    };
+
+    ws.onclose = function () {
+      conn.textContent = 'disconnected — retrying';
+      setTimeout(connect, 2000);
+    };
+
+    ws.onerror = function () { /* onclose follows and handles retry */ };
+
+    sock = {
+      emit: function (name, data) {
+        if (ws.readyState === 1) ws.send('42' + JSON.stringify([name, data]));
+      }
+    };
+  }
+
+  function fail(msg) {
+    conn.textContent = 'no connection';
+    diag.style.display = 'block';
+    diag.innerHTML = '<b>Could not reach the app over WebSocket.</b><br>· ' + msg +
+      '<br><br>Check the page is served from the board itself ' +
+      '(http://&lt;board-ip&gt;:7000), not opened as a local file.';
+  }
+
+  function showFrame(b64) {
+    var img = document.getElementById('cam');
+    var off = document.getElementById('camoff');
+    img.src = 'data:image/jpeg;base64,' + b64;
+    if (img.style.display === 'none') {
+      img.style.display = 'block';
+      off.style.display = 'none';
+    }
+  }
+
+  function paint(d) {
+    if (d.delta !== undefined && d.delta !== null) {
+      document.getElementById('delta').textContent = d.delta;
+      var pct = Math.max(0, Math.min(100, (d.delta / SCALE) * 100));
+      var f = document.getElementById('fill');
+      f.style.width = pct + '%';
+      f.style.background = d.delta >= threshold ? 'var(--wet)' : 'var(--dry)';
+    }
+    if (d.threshold !== undefined && d.threshold !== null) {
+      threshold = d.threshold;
+      document.getElementById('th').value = threshold;
+      document.getElementById('thval').textContent = threshold;
+      document.getElementById('mark').style.left = ((threshold / SCALE) * 100) + '%';
+    }
+    if (d.phase) document.getElementById('phase').textContent = d.phase;
+    if (d.wet !== undefined) document.getElementById('wet').textContent = d.wet;
+    if (d.dry !== undefined) document.getElementById('dry').textContent = d.dry;
+
+    var v = document.getElementById('vision');
+    if (d.label) {
+      v.classList.remove('off');
+      v.textContent = 'vision: ' + d.label + ' (' + (d.confidence || 0) + ')';
+    } else if (d.label === null) {
+      v.classList.add('off');
+      v.textContent = 'vision: nothing recognised';
+    }
+
+    if (d.decision) {
+      var tb = document.querySelector('#log tbody');
+      var tr = document.createElement('tr');
+      var t = (d.timestamp || '').substring(11, 19);
+      tr.innerHTML = '<td>' + t + '</td>' +
+                     '<td class="tag ' + d.decision + '">' + d.decision + '</td>' +
+                     '<td>' + (d.reason || '') + '</td>';
+      tb.insertBefore(tr, tb.firstChild);
+      while (tb.children.length > 12) tb.removeChild(tb.lastChild);
+    }
+  }
+
+  var th = document.getElementById('th');
+  th.addEventListener('input', function () {
+    threshold = parseInt(th.value, 10);
+    document.getElementById('thval').textContent = threshold;
+    document.getElementById('mark').style.left = ((threshold / SCALE) * 100) + '%';
+  });
+  th.addEventListener('change', function () {
+    if (sock) sock.emit('set_threshold', parseInt(th.value, 10));
+  });
+  document.getElementById('reset').addEventListener('click', function () {
+    if (sock) sock.emit('reset_counts', 1);
+  });
+  document.getElementById('recal').addEventListener('click', function () {
+    if (sock) sock.emit('recalibrate', 1);
+  });
+
+  document.getElementById('scale').textContent = SCALE;
+  document.getElementById('mark').style.left = ((threshold / SCALE) * 100) + '%';
+  connect();
+})();
+</script>
+</body>
+</html>
